@@ -30,6 +30,7 @@
 - `HEALTH_HOST` - хост мини HTTP сервера
 - `HEALTH_PATH` - путь healthcheck, по умолчанию `/health`
 - `PORT` - порт, Railway подставляет автоматически
+- `BOT_RETRY_SECONDS` - через сколько секунд бот повторит запуск после ошибки
 
 ## Railway
 
@@ -40,6 +41,11 @@
 3. Railway сам увидит `Dockerfile` и `railway.json`.
 4. Проверь переменные окружения.
 5. После деплоя бот поднимет polling и HTTP health endpoint.
+
+Обязательно добавь в Railway Variables:
+
+- `TELEGRAM_BOT_TOKEN`
+- `BACKEND_API_URL`
 
 Если Railway попросит команды вручную:
 

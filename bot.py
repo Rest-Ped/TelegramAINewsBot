@@ -8,6 +8,7 @@ import json
 import logging
 import os
 import threading
+import time
 from dataclasses import dataclass
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -35,6 +36,7 @@ class BotConfig:
     health_host: str
     health_path: str
     port: int
+    retry_seconds: int
 
 
 def load_config() -> BotConfig:
@@ -47,7 +49,12 @@ def load_config() -> BotConfig:
     if not health_path.startswith("/"):
         health_path = f"/{health_path}"
     return BotConfig(
-        token=(os.getenv("TELEGRAM_BOT_TOKEN") or "").strip(),
+        token=(
+            os.getenv("TELEGRAM_BOT_TOKEN")
+            or os.getenv("BOT_TOKEN")
+            or os.getenv("TG_BOT_TOKEN")
+            or ""
+        ).strip(),
         backend_api_url=backend_api_url,
         request_timeout=int(os.getenv("REQUEST_TIMEOUT", "30")),
         log_level=(os.getenv("LOG_LEVEL") or "INFO").upper(),
@@ -55,6 +62,7 @@ def load_config() -> BotConfig:
         health_host=(os.getenv("HEALTH_HOST") or "0.0.0.0").strip(),
         health_path=health_path,
         port=int(os.getenv("PORT", "8080")),
+        retry_seconds=max(5, int(os.getenv("BOT_RETRY_SECONDS", "15"))),
     )
 
 
@@ -70,6 +78,24 @@ def setup_logging() -> logging.Logger:
 
 
 LOGGER = setup_logging()
+
+
+RUNTIME_STATE: dict[str, Any] = {
+    "configured": bool(CONFIG.token),
+    "bot_started": False,
+    "last_error": "",
+}
+RUNTIME_LOCK = threading.Lock()
+
+
+def set_runtime_state(**updates: Any) -> None:
+    with RUNTIME_LOCK:
+        RUNTIME_STATE.update(updates)
+
+
+def runtime_state_snapshot() -> dict[str, Any]:
+    with RUNTIME_LOCK:
+        return dict(RUNTIME_STATE)
 
 
 class BackendAPIError(RuntimeError):
@@ -686,11 +712,15 @@ class HealthHandler(BaseHTTPRequestHandler):
             self.wfile.write(b'{"status":"not_found"}')
             return
 
+        state = runtime_state_snapshot()
         payload = {
             "status": "ok",
             "service": "telegram-bot",
             "bot_name": CONFIG.bot_name,
             "backend_api_url": CLIENT.base_url,
+            "configured": state.get("configured", False),
+            "bot_started": state.get("bot_started", False),
+            "last_error": state.get("last_error", ""),
         }
         body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
         self.send_response(200)
@@ -723,22 +753,41 @@ async def on_startup(application: Application):
         LOGGER.info("Backend healthcheck passed for %s", CONFIG.backend_api_url)
     except Exception as exc:
         LOGGER.warning("Backend healthcheck failed: %s", exc)
+    set_runtime_state(bot_started=True, last_error="")
+
+
+def idle_forever() -> None:
+    while True:
+        time.sleep(3600)
 
 
 def main():
-    if not CONFIG.token:
-        raise RuntimeError("TELEGRAM_BOT_TOKEN is not set in .env")
-
     start_health_server()
+    if not CONFIG.token:
+        message = "Telegram bot token is missing. Set TELEGRAM_BOT_TOKEN in Railway Variables."
+        set_runtime_state(configured=False, bot_started=False, last_error=message)
+        LOGGER.error(message)
+        idle_forever()
 
-    application = Application.builder().token(CONFIG.token).post_init(on_startup).build()
-    application.add_handler(CommandHandler("start", start))
-    application.add_handler(CommandHandler("help", help_command))
-    application.add_handler(CommandHandler("menu", start))
-    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
+    set_runtime_state(configured=True, bot_started=False, last_error="")
 
-    LOGGER.info("Starting Telegram bot")
-    application.run_polling(allowed_updates=Update.ALL_TYPES)
+    while True:
+        try:
+            application = Application.builder().token(CONFIG.token).post_init(on_startup).build()
+            application.add_handler(CommandHandler("start", start))
+            application.add_handler(CommandHandler("help", help_command))
+            application.add_handler(CommandHandler("menu", start))
+            application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
+
+            LOGGER.info("Starting Telegram bot")
+            application.run_polling(allowed_updates=Update.ALL_TYPES)
+            set_runtime_state(bot_started=False, last_error="Bot polling stopped.")
+            LOGGER.warning("Bot polling stopped. Waiting before restart.")
+        except Exception as exc:
+            set_runtime_state(bot_started=False, last_error=str(exc))
+            LOGGER.exception("Telegram bot crashed during startup or polling")
+
+        time.sleep(CONFIG.retry_seconds)
 
 
 if __name__ == "__main__":
